@@ -161,6 +161,12 @@ class CaptureHiddenMode(IntEnum):
 class ForwardBatch:
     """Store all inputs of a forward pass."""
 
+    # For block-attention
+    block_seq_lens: torch.Tensor
+    block_seq_lens_cpu: torch.Tensor
+    block_req_to_token_pool: ReqToTokenPool
+    block_seq_lens_sum: int
+
     # The forward mode
     forward_mode: ForwardMode
     # The batch size
@@ -311,10 +317,92 @@ class ForwardBatch:
         cls,
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
+        tokenizer,
+        ReqToTokenPool,
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
 
+        full_output_ids = batch.full_output_ids
+        original_input_ids = batch.original_input_ids
+        assert len(original_input_ids) == len(full_output_ids) == len(batch.seq_lens), f'Length mismatch among original_input_ids {len(original_input_ids)}, full_output_ids {len(full_output_ids)}, seq_lens {len(batch.seq_lens)}'
+        full_output_ids = [oii+foi for oii, foi in zip(original_input_ids, full_output_ids)]
+        if not all([len(foi)==seq_len for foi, seq_len in zip(full_output_ids, batch.seq_lens)]):
+            # assert all([len(foi)+1==seq_len for foi, seq_len in zip(full_output_ids, batch.seq_lens)]), f'full_output_ids lengths {[len(foi) for foi in full_output_ids]} do not match seq_lens {batch.seq_lens}'
+            assert len(full_output_ids) == batch.seq_lens.shape[0], f'full_output_ids batch size {len(full_output_ids)} does not match seq_lens batch size {batch.seq_lens.shape[0]}'
+            assert batch.input_ids.ndim == 1, f'batch.input_ids should be 1D tensor, but got shape {batch.input_ids.shape}'
+            assert batch.input_ids.shape[0] == len(full_output_ids), f'batch.input_ids length {batch.input_ids.shape[0]} does not match full_output_ids length {len(full_output_ids)}'
+            full_output_ids = [(foi + [batch.input_ids[bi,].item()]) if len(foi)+1 == batch.seq_lens[bi] else foi for bi, foi in enumerate(full_output_ids)]
+        assert all([len(foi)==seq_len for foi, seq_len in zip(full_output_ids, batch.seq_lens)]), f'full_output_ids lengths {[len(foi) for foi in full_output_ids]} do not match seq_lens {batch.seq_lens}'
+        assert batch.seq_lens_sum == sum(len(foi) for foi in full_output_ids), f'seq_lens_sum {batch.seq_lens_sum} does not match sum of full_output_ids lengths {[len(foi) for foi in full_output_ids]}, {batch.seq_lens=}'
+        if batch.seq_lens_cpu is not None:
+            assert len(batch.seq_lens_cpu) == len(batch.seq_lens)
+            assert all(
+                sl_cpu == sl_gpu
+                for sl_cpu, sl_gpu in zip(batch.seq_lens_cpu, batch.seq_lens)
+            ), f"seq_lens_cpu should be the same as seq_lens, but got {batch.seq_lens_cpu} vs {batch.seq_lens.tolist()}"
+        # assert isinstance(model_runner.req_to_token_pool, ReqToTokenPool)
+
+        #TODO: support overlap??, Now definitely not supported
+
+        req_to_token_pool = model_runner.req_to_token_pool.__class__(
+            size=model_runner.req_to_token_pool.size,
+            max_context_len=model_runner.req_to_token_pool.max_context_len,
+            device=model_runner.req_to_token_pool.device,
+            enable_memory_saver=model_runner.server_args.enable_memory_saver,
+        )
+        seq_lens_list = []
+        BLOCK_STARTER, BLOCK_ENDER = '<block>', '</block>'
+        BLOCK_ID_MAX_TOKEN_LEN = 4
+        for bi, seq_len in enumerate(batch.seq_lens.to('cpu').tolist()):
+            last_block_range = None
+            block_start_idx, block_end_idx = None, None
+            ti = BLOCK_ID_MAX_TOKEN_LEN
+            attention_mask = torch.ones(seq_len, dtype=torch.bool)
+            while ti <= seq_len:
+                cur_text = tokenizer.decode(full_output_ids[bi][ti-BLOCK_ID_MAX_TOKEN_LEN:ti])
+                if BLOCK_STARTER in cur_text:
+                    if block_start_idx is None:
+                        block_start_idx = ti
+                        ti += BLOCK_ID_MAX_TOKEN_LEN
+                        continue
+                    if block_end_idx is None:
+                        ti += BLOCK_ID_MAX_TOKEN_LEN
+                        continue
+                    assert block_start_idx is not None and block_end_idx is not None, "block_start_idx and block_end_idx should not be None here"
+                    last_block_range = (block_start_idx, block_end_idx)
+                    attention_mask[last_block_range[0]+BLOCK_ID_MAX_TOKEN_LEN:last_block_range[1]-BLOCK_ID_MAX_TOKEN_LEN] = False
+                    block_start_idx = ti - BLOCK_ID_MAX_TOKEN_LEN
+                    block_end_idx = None
+                    ti += BLOCK_ID_MAX_TOKEN_LEN
+                elif BLOCK_ENDER in cur_text:
+                    if block_start_idx is None:
+                        ti += BLOCK_ID_MAX_TOKEN_LEN
+                        continue
+                    block_end_idx = ti
+                    ti += BLOCK_ID_MAX_TOKEN_LEN
+                else:
+                    ti += 1
+            assert attention_mask.dtype == torch.bool, f"attention_mask dtype should be bool, but got {attention_mask.dtype}"
+            assert attention_mask.shape[0] == seq_len, f"attention_mask shape should be {seq_len}, but got {attention_mask.shape[0]}"
+            cur_seq_len = attention_mask.sum().item()
+            req_to_token_pool.req_to_token[bi, :cur_seq_len] = model_runner.req_to_token_pool.req_to_token[bi, :seq_len][attention_mask]
+            seq_lens_list.append(cur_seq_len)
+            print('~'*10, f'Request {bi}: original seq_len {seq_len} -> new seq_len {cur_seq_len} after removing blocks')
+            print(tokenizer.decode([token for token, keep in zip(full_output_ids[bi], attention_mask) if keep]))
+            print('-'*20)
+        seq_lens = torch.tensor(seq_lens_list, dtype=batch.seq_lens.dtype, device=batch.seq_lens.device)
+        seq_lens_sum = int(seq_lens.sum().item())
+        if batch.seq_lens_cpu is not None:
+            seq_lens_cpu = torch.tensor(seq_lens_list, dtype=batch.seq_lens_cpu.dtype, device=batch.seq_lens_cpu.device)
+        else:
+            seq_lens_cpu = None
+
         ret = cls(
+            block_seq_lens=seq_lens,
+            block_seq_lens_cpu=seq_lens_cpu,
+            block_req_to_token_pool=req_to_token_pool,
+            block_seq_lens_sum=seq_lens_sum,
+
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,

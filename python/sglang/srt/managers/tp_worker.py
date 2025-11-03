@@ -188,7 +188,7 @@ class BaseTpWorker(ABC):
         return self.model_runner.lora_manager.validate_lora_batch(lora_ids)
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner, self.tokenizer, ReqToTokenPool)
         logits_output, _ = self.model_runner.forward(forward_batch)
         embeddings = logits_output.embeddings
         return embeddings
@@ -351,7 +351,7 @@ class TpModelWorker(BaseTpWorker):
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner, self.tokenizer, ReqToTokenPool)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None

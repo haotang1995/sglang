@@ -1088,10 +1088,21 @@ class FlashAttentionBackend(AttentionBackend):
                 page_table = metadata.page_table
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
+                cu_seqlens_q = metadata.cu_seqlens_q
                 max_seqlen_q = metadata.max_seq_len_q
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
+
+
+                cache_seqlens = forward_batch.block_seq_lens.to(torch.int32)
+                max_seq_len_k = cache_seqlens.max().item()
+                page_table = forward_batch.block_req_to_token_pool.req_to_token[forward_batch.req_pool_indices, : max_seq_len_k]
+                cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+                )
+                # if layer.layer_id == 0:
+                    # print(f'Debug info: cache_seqlens={cache_seqlens}, max_seq_len_k={max_seq_len_k}, cu_seqlens_k={cu_seqlens_k}, page_table shape={page_table.shape}')
 
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
@@ -1100,7 +1111,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_cache=value_cache,
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k,
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,

@@ -171,6 +171,9 @@ class CaptureHiddenMode(IntEnum):
 class ForwardBatch:
     """Store all inputs of a forward pass."""
 
+    block_seq_lens: torch.Tensor
+    block_req_to_token_pool: ReqToTokenPool
+
     # The forward mode
     forward_mode: ForwardMode
     # The batch size
@@ -321,10 +324,77 @@ class ForwardBatch:
         cls,
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
+        tokenizer,
+        ReqToTokenPool,
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
 
+
+        full_output_ids = batch.full_output_ids
+        original_input_ids = batch.original_input_ids
+        assert len(original_input_ids) == len(full_output_ids) == len(batch.seq_lens), f'Length mismatch among original_input_ids {len(original_input_ids)}, full_output_ids {len(full_output_ids)}, seq_lens {len(batch.seq_lens)}'
+        full_output_ids = [oii+foi for oii, foi in zip(original_input_ids, full_output_ids)]
+        assert all([len(foi)==seq_len for foi, seq_len in zip(full_output_ids, batch.seq_lens)]), f'full_output_ids lengths {[len(foi) for foi in full_output_ids]} do not match seq_lens {batch.seq_lens}'
+        assert batch.seq_lens_sum == sum(len(foi) for foi in full_output_ids), f'seq_lens_sum {batch.seq_lens_sum} does not match sum of full_output_ids lengths {[len(foi) for foi in full_output_ids]}, {batch.seq_lens=}'
+
+        #TODO: support overlap??, Now definitely not supported
+
+        block_req_to_token_pool = model_runner.req_to_token_pool.__class__(
+            size=model_runner.req_to_token_pool.size,
+            max_context_len=model_runner.req_to_token_pool.max_context_len,
+            device=model_runner.req_to_token_pool.device,
+            enable_memory_saver=model_runner.server_args.enable_memory_saver,
+        )
+        block_seq_lens_list = []
+        BLOCK_STARTER, BLOCK_ENDER = '<block>', '</block>'
+        BLOCK_ID_MAX_TOKEN_LEN = 4
+        for bi, seq_len in enumerate(batch.seq_lens.to('cpu').tolist()):
+            last_block_range = None
+            block_start_idx, block_end_idx = None, None
+            ti = BLOCK_ID_MAX_TOKEN_LEN
+            attention_mask = torch.ones(seq_len, dtype=torch.bool)
+            while ti <= seq_len:
+                cur_text = tokenizer.decode(full_output_ids[bi][ti-BLOCK_ID_MAX_TOKEN_LEN:ti])
+                if BLOCK_STARTER in cur_text:
+                    if block_start_idx is None:
+                        block_start_idx = ti
+                        ti += BLOCK_ID_MAX_TOKEN_LEN
+                        continue
+                    if block_end_idx is None:
+                        ti += BLOCK_ID_MAX_TOKEN_LEN
+                        continue
+                    assert block_start_idx is not None and block_end_idx is not None, "block_start_idx and block_end_idx should not be None here"
+                    last_block_range = (block_start_idx, block_end_idx)
+                    attention_mask[last_block_range[0]+BLOCK_ID_MAX_TOKEN_LEN:last_block_range[1]-BLOCK_ID_MAX_TOKEN_LEN] = False
+                    block_start_idx = ti - BLOCK_ID_MAX_TOKEN_LEN
+                    block_end_idx = None
+                    ti += BLOCK_ID_MAX_TOKEN_LEN
+                elif BLOCK_ENDER in cur_text:
+                    if block_start_idx is None:
+                        ti += BLOCK_ID_MAX_TOKEN_LEN
+                        continue
+                    block_end_idx = ti
+                    ti += BLOCK_ID_MAX_TOKEN_LEN
+                else:
+                    ti += 1
+            assert attention_mask.dtype == torch.bool, f"attention_mask dtype should be bool, but got {attention_mask.dtype}"
+            assert attention_mask.shape[0] == seq_len, f"attention_mask shape should be {seq_len}, but got {attention_mask.shape[0]}"
+            cur_block_seq_len = attention_mask.sum().item()
+            #TODO: change bi index to req_pool_indices??
+            # block_req_to_token_pool.req_to_token[bi, :cur_block_seq_len] = model_runner.req_to_token_pool.req_to_token[bi, :seq_len][attention_mask]
+            block_req_to_token_pool.req_to_token[batch.req_pool_indices[bi], :cur_block_seq_len] = model_runner.req_to_token_pool.req_to_token[batch.req_pool_indices[bi], :seq_len][attention_mask]
+            # print(f'For debugging: setting {batch.req_pool_indices[bi]=}, {cur_block_seq_len=}, from original {model_runner.req_to_token_pool.req_to_token[batch.req_pool_indices[bi], :seq_len][attention_mask]} to {block_req_to_token_pool.req_to_token[batch.req_pool_indices[bi], :cur_block_seq_len]}')
+            block_seq_lens_list.append(cur_block_seq_len)
+            # if cur_block_seq_len % 500 == 0:
+                # print('~'*10, f'Request {bi}: original seq_len {seq_len} -> new seq_len {cur_block_seq_len} after removing blocks')
+                # print(tokenizer.decode([token for token, keep in zip(full_output_ids[bi], attention_mask) if keep]))
+                # print('-'*20)
+        block_seq_lens = torch.tensor(block_seq_lens_list, dtype=batch.seq_lens.dtype, device=batch.seq_lens.device)
+
         ret = cls(
+            block_seq_lens=block_seq_lens,
+            block_req_to_token_pool=block_req_to_token_pool,
+
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,

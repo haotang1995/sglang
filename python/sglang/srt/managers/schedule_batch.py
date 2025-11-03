@@ -1708,6 +1708,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         return ModelWorkerBatch(
+            original_input_ids=[r.origin_input_ids for r in self.reqs],
+            full_output_ids=[r.output_ids for r in self.reqs],
+
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
@@ -1795,6 +1798,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
 @dataclasses.dataclass
 class ModelWorkerBatch:
+    # The original input_ids
+    original_input_ids: List[List[int]]
+    # The full output_ids
+    full_output_ids: List[List[int]]
+
     # The forward mode
     forward_mode: ForwardMode
     # The input ids

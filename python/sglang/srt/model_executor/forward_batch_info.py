@@ -352,57 +352,55 @@ class ForwardBatch:
 
         block_seq_lens_list = []
         BLOCK_STARTER, BLOCK_ENDER = '<block>', '</block>'
-        BLOCK_ID_MAX_TOKEN_LEN = 4
+        BLOCK_STARTER_ID = tokenizer.encode(BLOCK_STARTER, add_special_tokens=False)
+        assert len(BLOCK_STARTER_ID) == 1, "BLOCK_STARTER should correspond to a single token"
+        BLOCK_STARTER_ID = BLOCK_STARTER_ID[0]
+        BLOCK_ENDER_ID = tokenizer.encode(BLOCK_ENDER, add_special_tokens=False)
+        assert len(BLOCK_ENDER_ID) == 1, "BLOCK_ENDER should correspond to a single token"
+        BLOCK_ENDER_ID = BLOCK_ENDER_ID[0]
         mask_time, req2token_time = 0.0, 0.0
         decode_time, mask_op_time = 0.0, 0.0
         for bi, seq_len in enumerate(batch.seq_lens.to('cpu').tolist()):
             batch_start_time = time.time()
             last_block_range = None
             block_start_idx, block_end_idx = None, None
-            ti = BLOCK_ID_MAX_TOKEN_LEN
-            attention_mask = torch.ones(seq_len, dtype=torch.bool)
-            while ti <= seq_len:
-                decode_start_time = time.time()
-                cur_text = tokenizer.decode(full_output_ids[bi][ti-BLOCK_ID_MAX_TOKEN_LEN:ti])
-                decode_time += time.time() - decode_start_time
-                if BLOCK_STARTER in cur_text:
+            # attention_mask = torch.ones(seq_len, dtype=torch.bool)
+            attention_mask = torch.zeros(seq_len,)
+            indices_with_markers = [
+                ( idx, 'start')
+                if full_output_ids[bi][idx] == BLOCK_STARTER_ID else
+                ( idx, 'end')
+                for idx in range(seq_len) if full_output_ids[bi][idx] in (BLOCK_STARTER_ID, BLOCK_ENDER_ID)
+            ]
+            for idx, marker in indices_with_markers:
+                if marker == 'start':
+                    # Just entered a block
                     if block_start_idx is None:
-                        block_start_idx = ti
-                        ti += BLOCK_ID_MAX_TOKEN_LEN
+                        block_start_idx = idx
                         continue
+                    # Found a new block start without closing the last one,
+                    # ignore the recent one
                     if block_end_idx is None:
-                        ti += BLOCK_ID_MAX_TOKEN_LEN
                         continue
+
+                    # Found a new block start, close the last one
                     assert block_start_idx is not None and block_end_idx is not None, "block_start_idx and block_end_idx should not be None here"
                     last_block_range = (block_start_idx, block_end_idx)
-                    mask_op_start_time = time.time()
-                    attention_mask[last_block_range[0]+BLOCK_ID_MAX_TOKEN_LEN:last_block_range[1]-BLOCK_ID_MAX_TOKEN_LEN] = False
-                    mask_op_time += time.time() - mask_op_start_time
-                    block_start_idx = ti - BLOCK_ID_MAX_TOKEN_LEN
+                    # mask out everything in the last block
+                    attention_mask[last_block_range[0]+1] = 1
+                    attention_mask[last_block_range[1]-1] = -1
+                    # attention_mask[last_block_range[0]+1:last_block_range[1]-1] = 0
+                    block_start_idx = idx
                     block_end_idx = None
-                    ti += BLOCK_ID_MAX_TOKEN_LEN
-                elif BLOCK_ENDER in cur_text:
+                elif marker == 'end' and block_start_idx is not None:
+                    # Found a block end without having found a start, ignore
                     if block_start_idx is None:
-                        ti += BLOCK_ID_MAX_TOKEN_LEN
                         continue
-                    block_end_idx = ti
-                    ti += BLOCK_ID_MAX_TOKEN_LEN
-                else:
-                    # ti += 1
-                    # continue
-                    decode_start_time = time.time()
-                    next_ten_token_text = tokenizer.decode(full_output_ids[bi][ti-BLOCK_ID_MAX_TOKEN_LEN:ti+10])
-                    if BLOCK_STARTER in next_ten_token_text or BLOCK_ENDER in next_ten_token_text:
-                        ti += 1
-                    else:
-                        next_4k_token_text = tokenizer.decode(full_output_ids[bi][ti-BLOCK_ID_MAX_TOKEN_LEN:ti+4000])
-                        if BLOCK_STARTER in next_4k_token_text:
-                            next_4k_token_text = next_4k_token_text[:next_4k_token_text.index(BLOCK_STARTER)]
-                        if BLOCK_ENDER in next_4k_token_text:
-                            next_4k_token_text = next_4k_token_text[:next_4k_token_text.index(BLOCK_ENDER)]
-                        skip_len = len(tokenizer.encode(next_4k_token_text))
-                        ti += max(1, skip_len-5-BLOCK_ID_MAX_TOKEN_LEN)
-                    decode_time += time.time() - decode_start_time
+                    block_end_idx = idx
+            attention_mask = torch.cumsum(attention_mask, dim=0)
+            assert all(v in (0, 1) for v in attention_mask.tolist()), f"attention_mask values should be 0 or 1, but got {set(attention_mask.tolist())}"
+            attention_mask = 1 - attention_mask
+            attention_mask = attention_mask.bool()
             assert attention_mask.dtype == torch.bool, f"attention_mask dtype should be bool, but got {attention_mask.dtype}"
             assert attention_mask.shape[0] == seq_len, f"attention_mask shape should be {seq_len}, but got {attention_mask.shape[0]}"
             mask_time += time.time() - batch_start_time

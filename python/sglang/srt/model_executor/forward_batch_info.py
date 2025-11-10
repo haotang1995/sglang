@@ -329,9 +329,6 @@ class ForwardBatch:
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
 
-        import time
-        start_time = time.time()
-
         full_output_ids = batch.full_output_ids
         original_input_ids = batch.original_input_ids
         assert len(original_input_ids) == len(full_output_ids) == len(batch.seq_lens), f'Length mismatch among original_input_ids {len(original_input_ids)}, full_output_ids {len(full_output_ids)}, seq_lens {len(batch.seq_lens)}'
@@ -339,7 +336,6 @@ class ForwardBatch:
         assert all([len(foi)==seq_len for foi, seq_len in zip(full_output_ids, batch.seq_lens)]), f'full_output_ids lengths {[len(foi) for foi in full_output_ids]} do not match seq_lens {batch.seq_lens}'
         assert batch.seq_lens_sum == sum(len(foi) for foi in full_output_ids), f'seq_lens_sum {batch.seq_lens_sum} does not match sum of full_output_ids lengths {[len(foi) for foi in full_output_ids]}, {batch.seq_lens=}'
 
-        before_req2token_time = time.time() - start_time
         #TODO: support overlap??, Now definitely not supported
 
         block_req_to_token_pool = model_runner.req_to_token_pool.__class__(
@@ -348,23 +344,19 @@ class ForwardBatch:
             device=model_runner.req_to_token_pool.device,
             enable_memory_saver=model_runner.server_args.enable_memory_saver,
         )
-        init_req2token_time = time.time() - start_time - before_req2token_time
 
         block_seq_lens_list = []
-        BLOCK_STARTER, BLOCK_ENDER = '<block>', '</block>'
+        BLOCK_STARTER, BLOCK_ENDER = '<BLOCK>', '</BLOCK>'
         BLOCK_STARTER_ID = tokenizer.encode(BLOCK_STARTER, add_special_tokens=False)
         assert len(BLOCK_STARTER_ID) == 1, "BLOCK_STARTER should correspond to a single token"
         BLOCK_STARTER_ID = BLOCK_STARTER_ID[0]
         BLOCK_ENDER_ID = tokenizer.encode(BLOCK_ENDER, add_special_tokens=False)
         assert len(BLOCK_ENDER_ID) == 1, "BLOCK_ENDER should correspond to a single token"
         BLOCK_ENDER_ID = BLOCK_ENDER_ID[0]
-        mask_time, req2token_time = 0.0, 0.0
-        decode_time, mask_op_time = 0.0, 0.0
+
         for bi, seq_len in enumerate(batch.seq_lens.to('cpu').tolist()):
-            batch_start_time = time.time()
             last_block_range = None
             block_start_idx, block_end_idx = None, None
-            # attention_mask = torch.ones(seq_len, dtype=torch.bool)
             attention_mask = torch.zeros(seq_len,)
             indices_with_markers = [
                 ( idx, 'start')
@@ -378,8 +370,7 @@ class ForwardBatch:
                     if block_start_idx is None:
                         block_start_idx = idx
                         continue
-                    # Found a new block start without closing the last one,
-                    # ignore the recent one
+                    # Found a new block start without closing the last one, ignore the recent one
                     if block_end_idx is None:
                         continue
 
@@ -387,9 +378,7 @@ class ForwardBatch:
                     assert block_start_idx is not None and block_end_idx is not None, "block_start_idx and block_end_idx should not be None here"
                     last_block_range = (block_start_idx, block_end_idx)
                     # mask out everything in the last block
-                    attention_mask[last_block_range[0]+1] = 1
-                    attention_mask[last_block_range[1]-1] = -1
-                    # attention_mask[last_block_range[0]+1:last_block_range[1]-1] = 0
+                    attention_mask[last_block_range[0]+1:last_block_range[1]-1] = 0
                     block_start_idx = idx
                     block_end_idx = None
                 elif marker == 'end' and block_start_idx is not None:
@@ -397,32 +386,14 @@ class ForwardBatch:
                     if block_start_idx is None:
                         continue
                     block_end_idx = idx
-            attention_mask = torch.cumsum(attention_mask, dim=0)
-            assert all(v in (0, 1) for v in attention_mask.tolist()), f"attention_mask values should be 0 or 1, but got {set(attention_mask.tolist())}"
-            attention_mask = 1 - attention_mask
+
             attention_mask = attention_mask.bool()
             assert attention_mask.dtype == torch.bool, f"attention_mask dtype should be bool, but got {attention_mask.dtype}"
             assert attention_mask.shape[0] == seq_len, f"attention_mask shape should be {seq_len}, but got {attention_mask.shape[0]}"
-            mask_time += time.time() - batch_start_time
             cur_block_seq_len = attention_mask.sum().item()
-            #TODO: change bi index to req_pool_indices??
-            # block_req_to_token_pool.req_to_token[bi, :cur_block_seq_len] = model_runner.req_to_token_pool.req_to_token[bi, :seq_len][attention_mask]
             block_req_to_token_pool.req_to_token[batch.req_pool_indices[bi], :cur_block_seq_len] = model_runner.req_to_token_pool.req_to_token[batch.req_pool_indices[bi], :seq_len][attention_mask]
-            # print(f'For debugging: setting {batch.req_pool_indices[bi]=}, {cur_block_seq_len=}, from original {model_runner.req_to_token_pool.req_to_token[batch.req_pool_indices[bi], :seq_len][attention_mask]} to {block_req_to_token_pool.req_to_token[batch.req_pool_indices[bi], :cur_block_seq_len]}')
             block_seq_lens_list.append(cur_block_seq_len)
-            req2token_time += time.time() - batch_start_time
-            # if cur_block_seq_len % 500 == 0:
-                # print('~'*10, f'Request {bi}: original seq_len {seq_len} -> new seq_len {cur_block_seq_len} after removing blocks')
-                # print(tokenizer.decode([token for token, keep in zip(full_output_ids[bi], attention_mask) if keep]))
-                # print('-'*20)
-        req2token_time -= mask_time
         block_seq_lens = torch.tensor(block_seq_lens_list, dtype=batch.seq_lens.dtype, device=batch.seq_lens.device)
-        block_req2token_time = time.time() - start_time - before_req2token_time - init_req2token_time
-
-        if block_seq_lens.max().item() % 500 == 0:
-            total_time = time.time() - start_time
-            print('~'*10, f"Preprocess time: {time.time()-start_time:.2f}s, before_req2token_time_ratio: {before_req2token_time/total_time:.2%}, init_req2token_time_ratio: {init_req2token_time/total_time:.2%}, mask_time_ratio: {mask_time/total_time:.2%}, req2token_time_ratio: {req2token_time/total_time:.2%}, block_req2token_time_ratio: {block_req2token_time/total_time:.2%}, decode_time_ratio: {decode_time/total_time:.2%}, mask_op_time_ratio: {mask_op_time/total_time:.2%}")
-            print(f"Batch: original max seq_len {batch.seq_lens.max().item()} -> new max seq_len {block_seq_lens.max().item()} after removing blocks")
 
         ret = cls(
             block_seq_lens=block_seq_lens,

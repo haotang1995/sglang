@@ -357,7 +357,7 @@ class ForwardBatch:
         for bi, seq_len in enumerate(batch.seq_lens.to('cpu').tolist()):
             last_block_range = None
             block_start_idx, block_end_idx = None, None
-            attention_mask = torch.zeros(seq_len,)
+            attention_mask = torch.ones(seq_len, dtype=torch.int8, device=model_runner.device)
             indices_with_markers = [
                 ( idx, 'start')
                 if full_output_ids[bi][idx] == BLOCK_STARTER_ID else
